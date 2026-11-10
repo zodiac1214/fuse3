@@ -38,6 +38,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use errno::Errno;
 pub use helper::{mode_from_kind_and_perm, perm_from_mode_and_kind};
+#[cfg(target_os = "macos")]
+pub use mount_options::MacFuseBackend;
 pub use mount_options::MountOptions;
 use nix::sys::stat::mode_t;
 use raw::abi::{

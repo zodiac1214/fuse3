@@ -16,6 +16,7 @@ use std::ops::{Deref, DerefMut};
     target_os = "freebsd",
 ))]
 use std::os::fd::OwnedFd;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(target_os = "freebsd")]
 use std::os::unix::fs::OpenOptionsExt;
@@ -71,10 +72,12 @@ use tokio::task;
     target_os = "macos"
 ))]
 use tracing::debug;
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
 use tracing::warn;
 
 use super::CompleteIoResult;
+#[cfg(target_os = "macos")]
+use super::mfmount;
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "macos"
@@ -134,6 +137,36 @@ impl FuseConnection {
         mount_path: impl AsRef<Path>,
         unmount_notify: Arc<Notify>,
     ) -> io::Result<Self> {
+        use crate::MacFuseBackend;
+
+        match mount_options.macfuse_backend {
+            MacFuseBackend::Kernel => {}
+            MacFuseBackend::FsKit => {
+                let connection =
+                    ChannelFuseConnection::new(&mount_options, mount_path.as_ref()).await?;
+
+                return Ok(Self {
+                    unmount_notify,
+                    mode: ConnectionMode::Channel(connection),
+                });
+            }
+            MacFuseBackend::Auto => {
+                match ChannelFuseConnection::new(&mount_options, mount_path.as_ref()).await {
+                    Ok(connection) => {
+                        return Ok(Self {
+                            unmount_notify,
+                            mode: ConnectionMode::Channel(connection),
+                        });
+                    }
+                    Err(err) => {
+                        warn!(
+                            "macFUSE FSKit backend unavailable ({err}); using the kernel backend"
+                        );
+                    }
+                }
+            }
+        }
+
         let connection =
             BlockFuseConnection::new_with_unprivileged(mount_options, mount_path).await?;
 
@@ -141,6 +174,16 @@ impl FuseConnection {
             unmount_notify,
             mode: ConnectionMode::Block(connection),
         })
+    }
+
+    /// Wait until the volume is mounted. Only an FSKit mount can still be
+    /// in progress when the session starts; every other kind is complete.
+    #[cfg(target_os = "macos")]
+    pub async fn wait_mounted(&self) -> io::Result<()> {
+        match &self.mode {
+            ConnectionMode::Channel(connection) => connection.wait_mounted().await,
+            _ => Ok(()),
+        }
     }
 
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
@@ -174,6 +217,10 @@ impl FuseConnection {
             ConnectionMode::NonBlock(connection) => {
                 connection.read_vectored(header_buf, data_buf).await
             }
+            #[cfg(target_os = "macos")]
+            ConnectionMode::Channel(connection) => {
+                connection.read_vectored(header_buf, data_buf).await
+            }
         }
     }
 
@@ -194,6 +241,10 @@ impl FuseConnection {
             ConnectionMode::NonBlock(connection) => {
                 connection.write_vectored(data, body_extend_data).await
             }
+            #[cfg(target_os = "macos")]
+            ConnectionMode::Channel(connection) => {
+                connection.write_vectored(data, body_extend_data).await
+            }
         }
     }
 }
@@ -207,6 +258,154 @@ enum ConnectionMode {
         target_os = "freebsd",
     ))]
     NonBlock(NonBlockFuseConnection),
+    /// macFUSE's FSKit backend: messages over an `MFMount` channel, no fd.
+    #[cfg(target_os = "macos")]
+    Channel(ChannelFuseConnection),
+}
+
+/// A connection over a macFUSE `MFMount` channel (FSKit backend).
+///
+/// Mirrors [`BlockFuseConnection`]: one blocking receive at a time on the
+/// blocking pool, sends serialised by a lock.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct ChannelFuseConnection {
+    channel: Arc<mfmount::Channel>,
+    /// `MFMount()` still running when the connection was handed over: it
+    /// returns once the volume has finished activating, which needs the
+    /// session serving INIT and the first lookups meanwhile.
+    mounting: Mutex<Option<task::JoinHandle<io::Result<()>>>>,
+    read: Mutex<()>,
+    write: Mutex<()>,
+}
+
+/// Close the channel when the session lets go of the connection.
+///
+/// A read the session gave up on (it stops on the unmount notification, not
+/// on the read finishing) is still parked in `MFChannelCopyNextMessage` on a
+/// blocking thread, and that thread holds its own reference to the channel,
+/// so the channel's own drop never runs. Closing here wakes it with `ENODEV`;
+/// otherwise it sits there until macFUSE gives up on the volume, about a
+/// minute, and a runtime shutdown waits for it. The device-backed connection
+/// gets the same effect from its file descriptor closing on drop.
+#[cfg(target_os = "macos")]
+impl Drop for ChannelFuseConnection {
+    fn drop(&mut self) {
+        self.channel.close();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ChannelFuseConnection {
+    async fn new(mount_options: &MountOptions, mount_path: &Path) -> io::Result<Self> {
+        let options = mount_options.build_mfmount();
+        let (mount_point, options) = mfmount::mount_args(mount_path, &options.to_string_lossy())?;
+        let channel = Arc::new(mfmount::Channel::new()?);
+
+        // MFMount() returns only after the volume has activated, which takes
+        // the FUSE INIT exchange and the first requests, so it needs the
+        // session already reading this channel. The mount runs on its own
+        // thread and the connection is handed to the session as soon as the
+        // first message (INIT) is waiting; the session then waits for the
+        // mount with `wait_mounted`. A failed mount closes the channel, which
+        // ends the session.
+        debug!("mounting through the macFUSE FSKit backend");
+        let mounting = Arc::clone(&channel);
+        let mut mount = task::spawn_blocking(move || {
+            let result = mounting.mount(&mount_point, &options);
+            if result.is_err() {
+                mounting.close();
+            }
+            result
+        });
+        let waiting = Arc::clone(&channel);
+        let mut first_message = task::spawn_blocking(move || waiting.wait_for_message());
+
+        let mounting = tokio::select! {
+            mounted = &mut mount => {
+                // Finished (or failed) before INIT arrived; wake the waiter.
+                channel.interrupt();
+                let _ = first_message.await;
+                mounted.map_err(io::Error::other)??;
+                None
+            }
+            ready = &mut first_message => {
+                match ready.map_err(io::Error::other)? {
+                    Ok(true) => Some(mount),
+                    // Interrupted or failed waiting: the mount decides.
+                    Ok(false) | Err(_) => {
+                        mount.await.map_err(io::Error::other)??;
+                        None
+                    }
+                }
+            }
+        };
+
+        Ok(Self {
+            channel,
+            mounting: Mutex::new(mounting),
+            read: Mutex::new(()),
+            write: Mutex::new(()),
+        })
+    }
+
+    /// Wait for `MFMount()` to finish, once the session is serving.
+    async fn wait_mounted(&self) -> io::Result<()> {
+        let Some(mount) = self.mounting.lock().await.take() else {
+            return Ok(());
+        };
+        mount.await.map_err(io::Error::other)??;
+        debug!("macFUSE FSKit mount complete");
+        Ok(())
+    }
+
+    async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
+        &self,
+        mut header_buf: Vec<u8>,
+        mut data_buf: T,
+    ) -> CompleteIoResult<(Vec<u8>, T), usize> {
+        let _guard = self.read.lock().await;
+        let channel = Arc::clone(&self.channel);
+
+        task::spawn_blocking(move || {
+            let res = channel.receive(&mut [&mut header_buf, &mut data_buf]);
+            ((header_buf, data_buf), res)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
+        &self,
+        data: T,
+        body_extend_data: Option<U>,
+    ) -> CompleteIoResult<(T, Option<U>), usize> {
+        let _guard = self.write.lock().await;
+
+        // MFChannelSendMessage is not documented as non-blocking (it is an
+        // XPC send to macFUSE's extension), so it runs on the blocking pool
+        // like the receive: a burst of 1 MiB read replies must not park the
+        // runtime's workers. The session lends `data` only for this call, so
+        // it is copied into owned buffers for the blocking thread; that copy
+        // is small beside the XPC transfer itself.
+        //
+        // The header and the payload must stay separate iovecs: the FSKit
+        // transport reads the first buffer as the structured reply and the
+        // second as its payload, as `MFMessageGetBodyBuffers` lays out a
+        // request. Joining them into one buffer makes every reply with a
+        // body fail with EIO (seen in `tests/macos_fskit.rs`).
+        let header = data.to_vec();
+        let payload = body_extend_data.as_deref().map(<[u8]>::to_vec);
+        let channel = Arc::clone(&self.channel);
+        let res = task::spawn_blocking(move || match &payload {
+            None => channel.send(&[IoSlice::new(&header)]),
+            Some(payload) => channel.send(&[IoSlice::new(&header), IoSlice::new(payload)]),
+        })
+        .await
+        .unwrap_or_else(|err| Err(io::Error::other(err)));
+
+        ((data, body_extend_data), res)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -595,6 +794,10 @@ impl NonBlockFuseConnection {
     }
 }
 
+// Only the root mounts on Linux and FreeBSD need the device fd (to pass it
+// in the mount options). On macOS the connection may be an MFMount channel,
+// which has no fd at all.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 impl AsFd for FuseConnection {
     fn as_fd(&self) -> BorrowedFd<'_> {
         match &self.mode {

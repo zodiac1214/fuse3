@@ -286,6 +286,7 @@ dependencies = [
  "slab",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "trait-make",
  "which",
  "zerocopy",

@@ -7,6 +7,24 @@ use nix::mount::Nmount;
 #[cfg(target_os = "linux")]
 use nix::unistd;
 
+/// Which macFUSE backend serves a mount (macOS only).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum MacFuseBackend {
+    /// The macFUSE kernel extension, through `/dev/macfuse`. Works on every
+    /// macOS macFUSE supports, but the kext needs Recovery mode approval on
+    /// Apple Silicon.
+    #[default]
+    Kernel,
+    /// macFUSE's FSKit backend, through its `MFMount` channel API (macFUSE
+    /// 5.3.3+). No kernel extension; the user turns macFUSE on once under
+    /// File System Extensions in System Settings.
+    FsKit,
+    /// FSKit when macFUSE can mount with it, the kernel extension otherwise
+    /// (macFUSE missing or too old, extension not enabled, unsupported macOS).
+    Auto,
+}
+
 /// mount options.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct MountOptions {
@@ -48,6 +66,10 @@ pub struct MountOptions {
     // Other FUSE mount options
     // default 40000
     pub(crate) rootmode: Option<u32>,
+
+    // macFUSE backend: kernel extension, FSKit through MFMount, or either
+    #[cfg(target_os = "macos")]
+    pub(crate) macfuse_backend: MacFuseBackend,
 }
 
 impl MountOptions {
@@ -172,6 +194,20 @@ impl MountOptions {
     }
 
     /// set custom options for fuse filesystem, the custom options will be used in mount
+    /// Choose the macFUSE backend (macOS only). Default is
+    /// [`MacFuseBackend::Kernel`].
+    ///
+    /// The FSKit backend needs no kernel extension, so none of the Recovery
+    /// mode approval the kext requires on Apple Silicon. FUSE messages travel
+    /// over macFUSE's `MFMount` channel API instead of `/dev/macfuse`, so the
+    /// filesystem itself is unchanged.
+    #[cfg(target_os = "macos")]
+    pub fn macfuse_backend(&mut self, backend: MacFuseBackend) -> &mut Self {
+        self.macfuse_backend = backend;
+
+        self
+    }
+
     pub fn custom_options(&mut self, custom_options: impl Into<OsString>) -> &mut Self {
         self.custom_options = Some(custom_options.into());
 
@@ -243,6 +279,7 @@ impl MountOptions {
         options
     }
 
+    /// The `-o` argument for macFUSE's `mount_macfuse` helper (kernel backend).
     #[cfg(target_os = "macos")]
     pub(crate) fn build(&self) -> OsString {
         // macFUSE expects a single `-o` followed by a comma-separated option
@@ -250,6 +287,22 @@ impl MountOptions {
         // flags. The old form (`-o fsname=ofs -o allow_root`) was passed to the
         // mount helper as one argument, so every option after the first was
         // silently dropped — e.g. a caller-supplied `nobrowse` never took effect.
+        let mut options = OsString::from("-o ");
+        options.push(self.macos_option_list());
+        options
+    }
+
+    /// The option string for `MFMount()` (FSKit backend): the same list the
+    /// kernel backend gets, without `-o`, selecting the FSKit backend.
+    #[cfg(all(target_os = "macos", feature = "tokio-runtime"))]
+    pub(crate) fn build_mfmount(&self) -> OsString {
+        let mut options = self.macos_option_list();
+        options.push(",backend=fskit");
+        options
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_option_list(&self) -> OsString {
         let mut opts = vec![String::from("fsname=ofs")];
 
         if self.allow_root {
@@ -260,7 +313,7 @@ impl MountOptions {
             opts.push("allow_other".to_string());
         }
 
-        let mut options = OsString::from(format!("-o {}", opts.join(",")));
+        let mut options = OsString::from(opts.join(","));
 
         if let Some(custom_options) = &self.custom_options {
             options.push(",");
@@ -340,30 +393,6 @@ impl MountOptions {
         flags
     }
 
-    #[cfg(target_os = "macos")]
-    pub(crate) fn flags(&self) -> nix::mount::MntFlags {
-        use nix::mount::MntFlags;
-
-        let mut flags = MntFlags::empty();
-        if self.noatime {
-            flags.insert(MntFlags::MNT_NOATIME);
-        }
-        if self.noexec {
-            flags.insert(MntFlags::MNT_NOEXEC);
-        }
-        if self.nosuid {
-            flags.insert(MntFlags::MNT_NOSUID);
-        }
-        if self.read_only {
-            flags.insert(MntFlags::MNT_RDONLY);
-        }
-
-        if self.sync {
-            flags.insert(MntFlags::MNT_SYNCHRONOUS);
-        }
-        flags
-    }
-
     #[cfg(target_os = "linux")]
     pub(crate) fn flags(&self) -> nix::mount::MsFlags {
         use nix::mount::MsFlags;
@@ -394,5 +423,43 @@ impl MountOptions {
             flags.insert(MsFlags::MS_SYNCHRONOUS);
         }
         flags
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    fn options() -> MountOptions {
+        let mut options = MountOptions::default();
+        options
+            .allow_root(true)
+            .custom_options("volname=v,nobrowse");
+        options
+    }
+
+    #[test]
+    fn the_kernel_backend_gets_one_comma_joined_dash_o() {
+        assert_eq!(
+            options().build(),
+            OsString::from("-o fsname=ofs,allow_root,volname=v,nobrowse")
+        );
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn mfmount_gets_the_same_list_without_dash_o_and_selects_fskit() {
+        assert_eq!(
+            options().build_mfmount(),
+            OsString::from("fsname=ofs,allow_root,volname=v,nobrowse,backend=fskit")
+        );
+    }
+
+    #[test]
+    fn the_kernel_backend_is_the_default() {
+        let mut options = MountOptions::default();
+        assert_eq!(options.macfuse_backend, MacFuseBackend::Kernel);
+        options.macfuse_backend(MacFuseBackend::Auto);
+        assert_eq!(options.macfuse_backend, MacFuseBackend::Auto);
     }
 }

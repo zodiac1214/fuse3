@@ -122,6 +122,15 @@ impl FuseConnection {
         mount_path: impl AsRef<Path>,
         unmount_notify: Arc<Notify>,
     ) -> io::Result<Self> {
+        // The MFMount channel transport is implemented for the tokio runtime
+        // only; refuse rather than silently fall back to the kernel extension.
+        if mount_options.macfuse_backend == crate::MacFuseBackend::FsKit {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the macFUSE FSKit backend needs the tokio-runtime feature",
+            ));
+        }
+
         let connection =
             BlockFuseConnection::new_with_unprivileged(mount_options, mount_path).await?;
 

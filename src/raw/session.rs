@@ -212,10 +212,7 @@ struct MountHandleInner {
     task: JoinHandle<IoResult<()>>,
     mount_path: PathBuf,
     destroy_notify: Arc<async_notify::Notify>,
-    #[cfg(any(
-        all(target_os = "linux", feature = "unprivileged"),
-        target_os = "macos"
-    ))]
+    #[cfg(all(target_os = "linux", feature = "unprivileged"))]
     unprivileged: bool,
 }
 
@@ -437,20 +434,33 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         )
         .await?;
 
-        self.fuse_connection.replace(Arc::new(fuse_connection));
+        let fuse_connection = Arc::new(fuse_connection);
+        self.fuse_connection.replace(Arc::clone(&fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
 
-        debug!("mount {:?} success", mount_path);
-
-        Ok(MountHandle {
+        #[cfg_attr(not(feature = "tokio-runtime"), allow(unused_mut))]
+        let mut handle = MountHandle {
             inner: Some(MountHandleInner {
                 task: task::spawn(self.inner_mount()),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
-                unprivileged: true,
             }),
-        })
+        };
+
+        // An FSKit mount completes only while the session serves it, so the
+        // session must already be running here.
+        #[cfg(feature = "tokio-runtime")]
+        if let Err(err) = fuse_connection.wait_mounted().await {
+            // The failed mount closed the channel, which ends the session;
+            // there is nothing to unmount.
+            handle.inner.take();
+            return Err(err);
+        }
+
+        debug!("mount {:?} success", mount_path);
+
+        Ok(handle)
     }
 
     /// mount the filesystem without root permission.

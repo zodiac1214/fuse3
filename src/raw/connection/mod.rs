@@ -7,6 +7,8 @@ pub use tokio::FuseConnection;
 
 #[cfg(feature = "async-io-runtime")]
 mod async_io;
+#[cfg(all(target_os = "macos", feature = "tokio-runtime"))]
+mod mfmount;
 #[cfg(feature = "tokio-runtime")]
 mod tokio;
 
